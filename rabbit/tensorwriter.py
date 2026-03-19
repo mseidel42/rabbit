@@ -224,11 +224,21 @@ class TensorWriter:
         elif symmetrize == "average":
             # symmetrize by average of up and down variations
             logkavg_proc = 0.5 * (logkup + logkdown)
-        elif symmetrize in ["linear", "quadratic"]:
+        elif symmetrize in ["linear", "quadratic", "horizontal"]:
             # "linear" corresponds to a piecewise linear dependence of logk on theta
             # while "quadratic" corresponds to a quadratic dependence and leads
             # to a large variance
             diff_fact = np.sqrt(3.0) if symmetrize == "quadratic" else 1.0
+
+            # For horizontal morphing approximation, we compute logk at alpha=0.5
+            # and alpha=-0.5 using the provided horizontal morphing variations if available
+            # However, _compute_asym_syst gets logkup and logkdown, which are only for alpha=+1 and -1.
+            # To properly implement a vertical scaling based on horizontal morphing,
+            # we should provide symmetrize="horizontal" in add_systematic.
+            # Here we just implement the standard linear split if "horizontal" is passed here,
+            # but it should ideally be handled earlier if we have the histograms.
+            if symmetrize == "horizontal":
+                diff_fact = 1.0
 
             # split asymmetric variation into two symmetric variations
             logkavg_proc = 0.5 * (logkup + logkdown)
@@ -361,12 +371,46 @@ class TensorWriter:
             syst_up = self.get_flat_values(h[0], flow=flow)
             syst_down = self.get_flat_values(h[1], flow=flow)
 
-            logkup_proc = self.get_logk(
-                syst_up, norm, kfactor, systematic_type=systematic_type
-            )
-            logkdown_proc = -self.get_logk(
-                syst_down, norm, kfactor, systematic_type=systematic_type
-            )
+            if symmetrize == "horizontal":
+                from rabbit.morphing import horizontal_morph_nd
+
+                # Compute logk based on horizontally morphed histograms at alpha = +0.5 and -0.5.
+                # Since logk(theta) = logkavg * theta + logkdiffavg * theta^2
+                # We evaluate the true horizontal morph at alpha = +0.5 and -0.5
+                # and solve for the best equivalent logk parameters.
+                shape_in = h[0].shape
+                norm_nd = norm.reshape(shape_in)
+                h_up_nd = syst_up.reshape(shape_in)
+                h_down_nd = syst_down.reshape(shape_in)
+
+                # Default morph axis is 0, assuming mass variations are along the primary axis
+                syst_up_half = horizontal_morph_nd(norm_nd, h_up_nd, h_down_nd, 0.5).flatten()
+                syst_down_half = horizontal_morph_nd(norm_nd, h_up_nd, h_down_nd, -0.5).flatten()
+
+                # For alpha = +- 0.5, logk(+0.5) = 0.5 * logkavg + 0.25 * logkdiffavg
+                # logk(-0.5) = -0.5 * logkavg + 0.25 * logkdiffavg
+                # logkavg = logk(+0.5) - logk(-0.5)
+                # logkdiffavg = 2 * (logk(+0.5) + logk(-0.5))
+
+                logk_up_half = self.get_logk(
+                    syst_up_half, norm, kfactor, systematic_type=systematic_type
+                )
+                logk_down_half = -self.get_logk(
+                    syst_down_half, norm, kfactor, systematic_type=systematic_type
+                )
+
+                # Reconstruct the equivalent "up" and "down" logk at alpha = 1
+                # so _compute_asym_syst can derive the SymAvg and SymDiff correctly
+                logkup_proc = logk_up_half - logk_down_half + 2 * (logk_up_half + logk_down_half)
+                logkdown_proc = logk_up_half - logk_down_half - 2 * (logk_up_half + logk_down_half)
+
+            else:
+                logkup_proc = self.get_logk(
+                    syst_up, norm, kfactor, systematic_type=systematic_type
+                )
+                logkdown_proc = -self.get_logk(
+                    syst_down, norm, kfactor, systematic_type=systematic_type
+                )
 
             logkavg_proc, var_name_out = self._compute_asym_syst(
                 logkup_proc,
